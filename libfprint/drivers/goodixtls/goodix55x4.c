@@ -43,9 +43,12 @@
 
 #include <math.h>
 
-#define GOODIX55X4_WIDTH 108
-#define GOODIX55X4_HEIGHT 88
-#define GOODIX55X4_SCAN_WIDTH 108
+/* 55a2 with the Windows config: raw image is 56 wide x 176 tall = 9856 px,
+ * raw frame = 176*56/4*6 = 14784 bytes (matches the working Python capture_tl).
+ * SCAN_WIDTH == WIDTH (no padding columns to crop on this sensor). */
+#define GOODIX55X4_WIDTH 56
+#define GOODIX55X4_HEIGHT 176
+#define GOODIX55X4_SCAN_WIDTH 56
 #define GOODIX55X4_FRAME_SIZE (GOODIX55X4_WIDTH * GOODIX55X4_HEIGHT)
 // For every 4 pixels there are 6 bytes and there are 8 extra start bytes and 5
 // extra end
@@ -63,6 +66,14 @@ struct _FpiDeviceGoodixTls55X4 {
   GSList *frames;
 
   Goodix55X4Pix empty_img[GOODIX55X4_FRAME_SIZE];
+
+  /* fdt_down command (0x0c,0x01 + 6 zones of {0x80, base>>1}) computed from the
+   * sensor's own baseline reported in the fdt_mode reply. The hardcoded
+   * fdt_switch_state_down_55X4 is for GF3268; this device (GF320x) has a
+   * different baseline, so finger-down never triggered with the static values. */
+  guint8 fdt_down_dyn[26];
+  guint8 fdt_down_len;
+  gboolean fdt_down_ready;
 };
 
 G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
@@ -106,7 +117,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
   fp_dbg("Device firmware: \"%s\"", firmware);
   g_print("%s\n", firmware);
 
-  if (strcmp(firmware, GOODIX_55X4_FIRMWARE_VERSION)) {
+  /* The 55a2 ships a different sub-model/version (e.g.
+   * GF3208/GF3258_RTSEC_APP_10062) than the reference 55b4
+   * (GF3268_RTSEC_APP_10041). Accept any GF32xx RTSEC app firmware of the
+   * family instead of requiring an exact string match. */
+  if (!g_str_has_prefix(firmware, "GF32") ||
+      g_strstr_len(firmware, -1, "RTSEC_APP") == NULL) {
     g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                 "Invalid device firmware: \"%s\"", firmware);
     fpi_ssm_mark_failed(user_data, error);
@@ -339,8 +355,15 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
 // ---- SCAN SECTION START ----
 
 enum SCAN_STAGES {
-  SCAN_STAGE_CALIBRATE,
+  /* Like the Windows driver: confirm the MCU considers TLS connected before
+   * scanning. If isTlsConnected is 0 here, get_image will answer with 0xd0
+   * (REQUEST_TLS_CONNECTION) - which is exactly the failure we see. */
+  SCAN_STAGE_QUERY_MCU,
+  /* 55a2 (GF3208/GF3258 fw 10062) returns 0xd0 / times out if asked for an
+   * image before any FDT mode switch, so switch to FDT mode BEFORE reading
+   * the empty calibration frame. */
   SCAN_STAGE_SWITCH_TO_FDT_MODE,
+  SCAN_STAGE_CALIBRATE,
   SCAN_STAGE_SWITCH_TO_FDT_DOWN,
   SCAN_STAGE_GET_IMG,
   SCAN_STAGE_SWITCH_TO_FDT_MODE2,
@@ -368,6 +391,45 @@ static void check_none_cmd(FpDevice *dev, guint8 *data, guint16 len,
     return;
   }
   g_print("CHECK NONE SUCCESS\n");
+  fpi_ssm_next_state(ssm);
+}
+
+/* Callback for the fdt_mode switch: the reply carries the sensor's per-zone
+ * baseline (4-byte header + 6x little-endian 16-bit values). The Windows driver
+ * derives each finger-detect threshold byte as (baseline >> 1), framed on the
+ * wire as {0x80, byte}. We build the fdt_down command from the live baseline so
+ * finger detection works on this sensor instead of the hardcoded GF3268 values. */
+static void fdt_mode_base_cb(FpDevice *dev, guint8 *data, guint16 len,
+                             gpointer ssm, GError *err) {
+  if (err) {
+    fpi_ssm_mark_failed(ssm, err);
+    return;
+  }
+  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+  /* reply = 4-byte header + N little-endian 16-bit zone baselines. Build an
+   * fdt_down command with the SAME zone count as fdt_mode (each zone framed as
+   * {0x80, base>>1}); a shorter command does not arm finger detection. */
+  int nzones = (len > 4) ? (len - 4) / 2 : 0;
+  if (nzones > 12)
+    nzones = 12;
+  if (nzones > 0) {
+    self->fdt_down_dyn[0] = 0x0c;
+    self->fdt_down_dyn[1] = 0x01;
+    GString *dbg = g_string_new(NULL);
+    for (int z = 0; z < nzones; z++) {
+      guint16 base = data[4 + 2 * z] | (data[5 + 2 * z] << 8);
+      guint8 thr = (base >> 1) & 0xff;
+      self->fdt_down_dyn[2 + 2 * z] = 0x80;
+      self->fdt_down_dyn[3 + 2 * z] = thr;
+      g_string_append_printf(dbg, "z%d=0x%04x->0x%02x ", z, base, thr);
+    }
+    self->fdt_down_len = 2 + 2 * nzones;
+    self->fdt_down_ready = TRUE;
+    fp_dbg("dynamic fdt_down (%d zones): %s", nzones, dbg->str);
+    g_string_free(dbg, TRUE);
+  } else {
+    fp_warn("fdt_mode reply too short (%d), keeping static fdt_down", len);
+  }
   fpi_ssm_next_state(ssm);
 }
 
@@ -606,7 +668,32 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
   return TRUE;
 }
 
+const guint8 fdt_switch_state_mode_55X4[] = {
+    0x0d, 0x01, 0x80, 0x12, 0x80, 0xaf, 0x80, 0x9a, 0x80,
+    0x87, 0x80, 0x12, 0x80, 0xa8, 0x80, 0x95, 0x80, 0x81,
+    0x80, 0x12, 0x80, 0xa7, 0x80, 0x98, 0x80, 0x84};
+
+const guint8 fdt_switch_state_mode2_55X4[] = {
+    0x0d, 0x01, 0x80, 0xb3, 0x80, 0xc6, 0x80, 0xbc, 0x80,
+    0xa8, 0x80, 0xb9, 0x80, 0xca, 0x80, 0xc2, 0x80, 0xab,
+    0x80, 0xb7, 0x80, 0xc6, 0x80, 0xbc, 0x80, 0xa6};
+
+const guint8 fdt_switch_state_down_55X4[] = {
+    0x0c, 0x01, 0x80, 0xb1, 0x80, 0xc6, 0x80, 0xbc, 0x80,
+    0xa6, 0x80, 0xb9, 0x80, 0xca, 0x80, 0xc2, 0x80, 0xab,
+    0x80, 0xb7, 0x80, 0xc7, 0x80, 0xbc, 0x80, 0xa7};
+
+const guint8 fdt_switch_state_up_55X4[] = {
+    0x0e, 0x01, 0x80, 0x92, 0x80, 0x9d, 0x80, 0x93, 0x80,
+    0x92, 0x80, 0x97, 0x80, 0x9e, 0x80, 0xa0, 0x80, 0x8e,
+    0x80, 0xab, 0x80, 0xa5, 0x80, 0xb0, 0x80, 0x12};
+
 enum scan_empty_img_state {
+  /* Replicate the Python capture3 flow that DID return a calibration frame on
+   * the 55a2: fdt_up + nav_0 before reading the (empty) image. Reading the
+   * image straight after fdt_mode made the device answer with 0xd0. */
+  SCAN_EMPTY_FDT_UP,
+  SCAN_EMPTY_NAV,
   SCAN_EMPTY_GET_IMG,
 
   SCAN_EMPTY_NUM,
@@ -629,6 +716,14 @@ static void scan_empty_run(FpiSsm *ssm, FpDevice *dev) {
 
   switch (fpi_ssm_get_cur_state(ssm)) {
 
+  case SCAN_EMPTY_FDT_UP:
+    goodix_send_mcu_switch_to_fdt_up(dev, (guint8 *)fdt_switch_state_up_55X4,
+                                     sizeof(fdt_switch_state_up_55X4), NULL,
+                                     check_none_cmd, ssm);
+    break;
+  case SCAN_EMPTY_NAV:
+    goodix_send_nav_0(dev, check_none_cmd, ssm);
+    break;
   case SCAN_EMPTY_GET_IMG:
     goodix_tls_read_image(dev, on_scan_empty_img, ssm);
     break;
@@ -643,46 +738,56 @@ static void scan_get_img(FpDevice *dev, FpiSsm *ssm) {
   goodix_tls_read_image(dev, scan_on_read_img, ssm);
 }
 
-const guint8 fdt_switch_state_mode_55X4[] = {
-    0x0d, 0x01, 0x80, 0x12, 0x80, 0xaf, 0x80, 0x9a, 0x80,
-    0x87, 0x80, 0x12, 0x80, 0xa8, 0x80, 0x95, 0x80, 0x81,
-    0x80, 0x12, 0x80, 0xa7, 0x80, 0x98, 0x80, 0x84};
-
-const guint8 fdt_switch_state_mode2_55X4[] = {
-    0x0d, 0x01, 0x80, 0xb3, 0x80, 0xc6, 0x80, 0xbc, 0x80,
-    0xa8, 0x80, 0xb9, 0x80, 0xca, 0x80, 0xc2, 0x80, 0xab,
-    0x80, 0xb7, 0x80, 0xc6, 0x80, 0xbc, 0x80, 0xa6};
-
-const guint8 fdt_switch_state_down_55X4[] = {
-    0x0c, 0x01, 0x80, 0xb1, 0x80, 0xc6, 0x80, 0xbc, 0x80,
-    0xa6, 0x80, 0xb9, 0x80, 0xca, 0x80, 0xc2, 0x80, 0xab,
-    0x80, 0xb7, 0x80, 0xc7, 0x80, 0xbc, 0x80, 0xa7};
-
-const guint8 fdt_switch_state_up_55X4[] = {
-    0x0e, 0x01, 0x80, 0x92, 0x80, 0x9d, 0x80, 0x93, 0x80,
-    0x92, 0x80, 0x97, 0x80, 0x9e, 0x80, 0xa0, 0x80, 0x8e,
-    0x80, 0xab, 0x80, 0xa5, 0x80, 0xb0, 0x80, 0x12};
+static void scan_query_mcu_cb(FpDevice *dev, guint8 *mcu_state, guint16 len,
+                              gpointer ssm, GError *error) {
+  if (error) {
+    fpi_ssm_mark_failed(ssm, error);
+    return;
+  }
+  GString *hx = g_string_new(NULL);
+  for (guint16 i = 0; i < len; i++)
+    g_string_append_printf(hx, "%02x", mcu_state[i]);
+  /* Windows parse: byte[2] bit... shows isTlsConnected. Log raw so we can see
+   * whether TLS actually took (compare to Windows 01023000003a0000...). */
+  gboolean tls_connected = (len > 2) && (mcu_state[2] & 0x10);
+  g_print("MCU STATE: %s  -> isTlsConnected guess=%d\n", hx->str,
+          tls_connected);
+  g_string_free(hx, TRUE);
+  fpi_ssm_next_state(ssm);
+}
 
 static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
   FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
 
   switch (fpi_ssm_get_cur_state(ssm)) {
+  case SCAN_STAGE_QUERY_MCU:
+    g_print("QUERY MCU STATE (confirm TLS connected, like Windows)\n");
+    goodix_send_query_mcu_state(dev, scan_query_mcu_cb, ssm);
+    break;
   case SCAN_STAGE_CALIBRATE:
     scan_empty_img(dev, ssm);
     break;
   case SCAN_STAGE_SWITCH_TO_FDT_MODE:
     g_print("SWITCH TO FDT MODE\n");
+    /* capture the per-zone baseline from the reply to build fdt_down */
     goodix_send_mcu_switch_to_fdt_mode(
         dev, (guint8 *)fdt_switch_state_mode_55X4,
-        sizeof(fdt_switch_state_mode_55X4), NULL, check_none_cmd, ssm);
+        sizeof(fdt_switch_state_mode_55X4), NULL, fdt_mode_base_cb, ssm);
     break;
 
-  case SCAN_STAGE_SWITCH_TO_FDT_DOWN:
+  case SCAN_STAGE_SWITCH_TO_FDT_DOWN: {
     g_print("SWITCH TO FDT DOWN\n");
-    goodix_send_mcu_switch_to_fdt_down(
-        dev, (guint8 *)fdt_switch_state_down_55X4,
-        sizeof(fdt_switch_state_down_55X4), NULL, check_none_cmd, ssm);
+    FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+    if (self->fdt_down_ready)
+      goodix_send_mcu_switch_to_fdt_down(dev, self->fdt_down_dyn,
+                                         self->fdt_down_len, NULL,
+                                         check_none_cmd, ssm);
+    else
+      goodix_send_mcu_switch_to_fdt_down(
+          dev, (guint8 *)fdt_switch_state_down_55X4,
+          sizeof(fdt_switch_state_down_55X4), NULL, check_none_cmd, ssm);
     break;
+  }
   case SCAN_STAGE_GET_IMG:
     g_print("SWITCH TO GET IMAGE\n");
     fpi_image_device_report_finger_status(img_dev, TRUE);

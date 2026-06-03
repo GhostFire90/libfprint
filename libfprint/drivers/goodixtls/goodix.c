@@ -29,6 +29,8 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
+#include <unistd.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
@@ -814,14 +816,16 @@ goodix_send_nav_0 (FpDevice *dev, GoodixDefaultCallback callback,
       cb_info->callback = G_CALLBACK (callback);
       cb_info->user_data = user_data;
 
+      /* 55a2 firmware only ACKs nav_0; it sends no separate data reply, so
+       * wait for the ACK only (reply=FALSE) to avoid a timeout. */
       goodix_send_protocol (dev, GOODIX_CMD_NAV_0, (guint8 *) &payload,
-                            sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                            sizeof (payload), NULL, TRUE, 0, FALSE,
                             goodix_receive_default, cb_info);
       return;
     }
 
   goodix_send_protocol (dev, GOODIX_CMD_NAV_0, (guint8 *) &payload,
-                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE, NULL,
+                        sizeof (payload), NULL, TRUE, 0, FALSE, NULL,
                         NULL);
 }
 
@@ -1475,6 +1479,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
     {
       fp_dbg ("Reading to proxy back");
       guint8 buff[1024];
+      /* First read blocks until the server starts its final flight. */
       int size = goodix_tls_client_recv (priv->tls_hop, buff, sizeof (buff));
       if (size < 0)
         {
@@ -1484,13 +1489,41 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
           return;
         }
+      /* The server's ChangeCipherSpec and Finished are written by the
+       * SSL_accept thread and may not both be available on the first read.
+       * If we forward only the ChangeCipherSpec the device never receives the
+       * Finished, never completes its handshake (isTlsConnected stays 0) and
+       * answers get_image with 0xd0. Keep draining (short timeout) so the
+       * whole final flight reaches the device. */
+      int fd = priv->tls_hop->client_fd;
+      while (size < (int) sizeof (buff))
+        {
+          fd_set rfds;
+          FD_ZERO (&rfds);
+          FD_SET (fd, &rfds);
+          struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+          if (select (fd + 1, &rfds, NULL, NULL, &tv) <= 0)
+            break;
+          int n = read (fd, buff + size, sizeof (buff) - size);
+          if (n <= 0)
+            break;
+          size += n;
+        }
+      fp_dbg ("proxying %d bytes of server final flight to device", size);
+      /* Send the COMPLETE final flight (ChangeCipherSpec + Finished) as a
+       * single TLS pack - this is what the working python reference does and
+       * what makes fw 10062 complete its handshake (isTlsConnected=1). */
       GError *err = NULL;
       if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, buff, size, NULL, &err))
         {
           fpi_ssm_mark_failed (ssm, err);
           return;
         }
-      fpi_ssm_next_state (ssm);
+      /* fw 10062 needs time to process the final flight and finish its
+       * handshake before we send TLS_SUCCESSFULLY_ESTABLISHED / get_image.
+       * Without this delay isTlsConnected stays 0 and get_image returns 0xd0
+       * (the working python reference happened to wait ~600ms here). */
+      fpi_ssm_next_state_delayed (ssm, 600);
     }
 }
 
