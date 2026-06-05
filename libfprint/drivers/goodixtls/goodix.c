@@ -856,6 +856,34 @@ goodix_send_mcu_switch_to_idle_mode (FpDevice *dev, guint8 sleep_time,
 }
 
 void
+goodix_send_set_led (FpDevice *dev, guint8 state, GoodixNoneCallback callback,
+                     gpointer user_data)
+{
+  /* MCU Set Led State (cmd 0xc6). The official Windows driver sends this during
+   * active capture to drive the orange "scanning" LED. Mirrors idle_mode: a
+   * short payload with checksum, no reply beyond the ack. */
+  GoodixSetLed payload = {.state = state};
+  GoodixCallbackInfo *cb_info;
+
+  if (callback)
+    {
+      cb_info = malloc (sizeof (GoodixCallbackInfo));
+
+      cb_info->callback = G_CALLBACK (callback);
+      cb_info->user_data = user_data;
+
+      goodix_send_protocol (dev, GOODIX_CMD_SET_LED, (guint8 *) &payload,
+                            sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
+                            goodix_receive_none, cb_info);
+      return;
+    }
+
+  goodix_send_protocol (dev, GOODIX_CMD_SET_LED, (guint8 *) &payload,
+                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
+                        NULL, NULL);
+}
+
+void
 goodix_send_mcu_switch_to_sleep_mode (FpDevice *dev, guint8 sleep_time,
                                      GoodixNoneCallback callback,
                                      gpointer user_data)

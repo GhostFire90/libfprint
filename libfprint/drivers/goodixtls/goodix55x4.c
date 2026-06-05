@@ -56,6 +56,34 @@
   (GOODIX55X4_HEIGHT * GOODIX55X4_SCAN_WIDTH) / 4 * 6
 #define GOODIX55X4_CAP_FRAMES 1 // Number of frames we capture per swipe
 
+/* ---- Swipe assembly (ported from ElvinStarry/libfprint goodix55a2.c) ----
+ * The 56-px sensor short axis is far too small for single-frame minutiae
+ * matching. We stream frames at ~24fps while the finger swipes along the long
+ * axis, rotate each frame 90deg (sensor long axis -> stripe width), and stack
+ * them into a wide landscape image with enough area for NBIS. */
+#define GOODIX55X4_CROP 4 /* drop 4 bogus rows/cols on every edge */
+#define GOODIX55X4_OUT_WIDTH (GOODIX55X4_WIDTH - 2 * GOODIX55X4_CROP)   /* 48 */
+#define GOODIX55X4_OUT_HEIGHT (GOODIX55X4_HEIGHT - 2 * GOODIX55X4_CROP) /* 168 */
+/* rotated stripe: sensor long axis (168) -> width, short axis (48) -> height */
+#define GOODIX55X4_SWIPE_FRAME_W GOODIX55X4_OUT_HEIGHT /* 168 */
+#define GOODIX55X4_SWIPE_FRAME_H GOODIX55X4_OUT_WIDTH  /* 48  */
+#define GOODIX55X4_SWIPE_MIN_FRAMES 5
+#define GOODIX55X4_SWIPE_MAX_FRAMES 60   /* hard cap on stored stripes */
+#define GOODIX55X4_FDT_TARGET 8 /* frames per capture in FDT-gated (Mode B) mode */
+#define GOODIX55X4_SWIPE_WAIT_FRAMES 250 /* max frames to wait for finger-on */
+#define GOODIX55X4_SWIPE_STATIC_THRESHOLD 12 /* MAD below this = not moving */
+#define GOODIX55X4_SWIPE_STATIC_FRAMES 4     /* this many static frames = end */
+/* Only KEEP a streamed frame whose MAD vs the last kept frame is >= this, so
+ * stored stripes cover distinct finger area (avoids the motion-smear from
+ * blending dozens of near-duplicate slow-swipe frames). */
+#define GOODIX55X4_SWIPE_KEEP_STEP 22
+#define GOODIX55X4_DPI 500.0
+#define GOODIX55X4_PPMM (GOODIX55X4_DPI / 25.4) /* ~19.685 */
+/* Finger present when the raw decoded mean drops this far below the no-finger
+ * baseline (~2450); a finger lowers the capacitive signal (~1748 with finger).
+ * Baseline is measured from the first streamed frames at runtime. */
+#define GOODIX55X4_FINGER_DROP 350
+
 typedef unsigned short Goodix55X4Pix;
 
 struct _FpiDeviceGoodixTls55X4 {
@@ -74,6 +102,22 @@ struct _FpiDeviceGoodixTls55X4 {
   guint8 fdt_down_dyn[26];
   guint8 fdt_down_len;
   gboolean fdt_down_ready;
+
+  /* How often we re-armed finger-detection because the captured frame was
+   * noise/empty (no real ridges). Bounded to avoid hammering USB forever. */
+  guint scan_retries;
+
+  /* ---- swipe assembly state ---- */
+  GSList *strips;            /* list of struct fpi_frame*, rotated stripes */
+  guint strips_len;
+  guint swipe_frame_idx;     /* total frames streamed this swipe */
+  gboolean finger_seen;
+  gboolean finger_moving;
+  guint static_count;
+  gint baseline_mean;        /* no-finger raw mean, measured at swipe start */
+  guint8 prev_out[GOODIX55X4_OUT_WIDTH * GOODIX55X4_OUT_HEIGHT];
+  guint8 last_kept_out[GOODIX55X4_OUT_WIDTH * GOODIX55X4_OUT_HEIGHT];
+  gboolean have_kept; /* a stripe has been stored since the last reset */
 };
 
 G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
@@ -115,7 +159,7 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
   }
 
   fp_dbg("Device firmware: \"%s\"", firmware);
-  g_print("%s\n", firmware);
+  fp_dbg("%s\n", firmware);
 
   /* The 55a2 ships a different sub-model/version (e.g.
    * GF3208/GF3258_RTSEC_APP_10062) than the reference 55b4
@@ -221,7 +265,7 @@ static void check_sleep_realtek(FpDevice *dev, gboolean success, gpointer user_d
                                     "failed to put into sleep mode (realtek)"));
     return;
   } else {
-    g_print("Device is now on sleep\n");
+    fp_dbg("Device is now on sleep\n");
   }
   fpi_ssm_next_state(user_data);
 }
@@ -267,7 +311,7 @@ static void activate_run_state(FpiSsm *ssm, FpDevice *dev) {
 
   switch (fpi_ssm_get_cur_state(ssm)) {
   case ACTIVATE_READ_AND_NOP:
-    g_print("Read and NO OP\n");
+    fp_dbg("Read and NO OP\n");
     // Nop seems to clear the previous command buffer. But we are
     // unable to do so.
     goodix_start_read_loop(dev);
@@ -275,33 +319,33 @@ static void activate_run_state(FpiSsm *ssm, FpDevice *dev) {
     break;
 
   case ACTIVATE_ENABLE_CHIP:
-    g_print("Enable Chip\n");
+    fp_dbg("Enable Chip\n");
     goodix_send_enable_chip(dev, TRUE, check_none, ssm);
     break;
 
   case ACTIVATE_NOP:
-    g_print("NO OP\n");
+    fp_dbg("NO OP\n");
     goodix_send_nop(dev, check_none, ssm);
     break;
 
   case ACTIVATE_CHECK_FW_VER:
-    g_print("Checking FW\n");
+    fp_dbg("Checking FW\n");
     goodix_send_firmware_version(dev, check_firmware_version, ssm);
     break;
 
   case ACTIVATE_CHECK_PSK:
-    g_print("Checking PSK\n");
+    fp_dbg("Checking PSK\n");
     goodix_send_preset_psk_read(dev, GOODIX_55X4_PSK_FLAGS, 32,
                                 check_preset_psk_read, ssm);
     break;
 
   case ACTIVATE_RESET:
-    g_print("Reset Device\n");
+    fp_dbg("Reset Device\n");
     goodix_send_reset(dev, TRUE, 20, check_reset, ssm);
     break;
 
   case ACTIVATE_SET_MCU_IDLE:
-    g_print("Device IDLE\n");
+    fp_dbg("Device IDLE\n");
     goodix_send_mcu_switch_to_idle_mode(dev, 20, check_idle, ssm);
     break;
 
@@ -310,14 +354,14 @@ static void activate_run_state(FpiSsm *ssm, FpDevice *dev) {
     //     break;
 
   case ACTIVATE_SET_MCU_CONFIG:
-    g_print("Uploading Device Config\n");
+    fp_dbg("Uploading Device Config\n");
     goodix_send_upload_config_mcu(dev, goodix_55x4_config,
                                   sizeof(goodix_55x4_config), NULL,
                                   check_config_upload, ssm);
     break;
 
     // case ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY:
-    //     g_print("Powerdown Scan Freq\n");
+    //     fp_dbg("Powerdown Scan Freq\n");
     //     /*goodix_send_set_powerdown_scan_frequency(
     //         dev, 100, check_powerdown_scan_freq, ssm);*/
     //     //goodix_send_drv_state(dev, check_powerdown_scan_freq, ssm);
@@ -365,6 +409,9 @@ enum SCAN_STAGES {
   SCAN_STAGE_SWITCH_TO_FDT_MODE,
   SCAN_STAGE_CALIBRATE,
   SCAN_STAGE_SWITCH_TO_FDT_DOWN,
+  /* Light the orange "scanning" LED right before we start streaming so the user
+   * knows WHEN to place/swipe the finger (the fw streams immediately after). */
+  SCAN_STAGE_SET_LED,
   SCAN_STAGE_GET_IMG,
   SCAN_STAGE_SWITCH_TO_FDT_MODE2,
   SCAN_STAGE_SWITCH_TO_FDT_UP_NO_REPLY,
@@ -386,11 +433,11 @@ enum SLEEP_STAGES {
 static void check_none_cmd(FpDevice *dev, guint8 *data, guint16 len,
                            gpointer ssm, GError *err) {
   if (err) {
-    g_print("CHECK NONE FAILED\n");
+    fp_dbg("CHECK NONE FAILED\n");
     fpi_ssm_mark_failed(ssm, err);
     return;
   }
-  g_print("CHECK NONE SUCCESS\n");
+  fp_dbg("CHECK NONE SUCCESS\n");
   fpi_ssm_next_state(ssm);
 }
 
@@ -564,50 +611,435 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
   self->frames = g_slist_append(self->frames, frame);
 }
 
+/* Reject empty/noise frames. The sensor's finger-detect (FDT) sometimes fires
+ * without a real finger (or before it settles); the resulting frame is pure
+ * sensor noise, which squash_frame_linear then stretches to full contrast. A
+ * real fingerprint is strongly periodic (the ridges), so its normalized
+ * autocorrelation at the ridge period is high; noise is aperiodic and stays
+ * near zero. Measured separation on real captures: ridges >=0.7, noise <=0.21.
+ * scale-invariant (divided by variance), so it works on the squashed image. */
+#define GOODIX55X4_VALIDITY_THRESHOLD 0.40
+/* Re-arm FDT at most this many times per scan before giving up on this swipe. */
+#define GOODIX55X4_MAX_SCAN_RETRIES 60
+
+static double frame_ridge_validity(const guint8 *img) {
+  const int W = GOODIX55X4_WIDTH, H = GOODIX55X4_HEIGHT;
+  double mean = 0.0;
+  for (int i = 0; i < W * H; ++i)
+    mean += img[i];
+  mean /= (double)(W * H);
+
+  double var = 0.0;
+  for (int i = 0; i < W * H; ++i) {
+    const double d = img[i] - mean;
+    var += d * d;
+  }
+  var /= (double)(W * H);
+  if (var < 1e-6)
+    return 0.0;
+
+  double best = 0.0;
+  /* vertical autocorrelation: shift by d rows */
+  for (int d = 4; d < 16; ++d) {
+    double acc = 0.0;
+    int cnt = 0;
+    for (int y = 0; y + d < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        acc += (img[x + y * W] - mean) * (img[x + (y + d) * W] - mean);
+        ++cnt;
+      }
+    const double ac = fabs((acc / cnt) / var);
+    if (ac > best)
+      best = ac;
+  }
+  /* horizontal autocorrelation: shift by d columns */
+  for (int d = 4; d < 16; ++d) {
+    double acc = 0.0;
+    int cnt = 0;
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x + d < W; ++x) {
+        acc += (img[x + y * W] - mean) * (img[(x + d) + y * W] - mean);
+        ++cnt;
+      }
+    const double ac = fabs((acc / cnt) / var);
+    if (ac > best)
+      best = ac;
+  }
+  return best;
+}
+
+/* ---- swipe imaging helpers (ported from ElvinStarry/libfprint goodix55a2) ---- */
+
+/* raw decoded mean over the full 56x176 frame (12-bit values) */
+static gint swipe_raw_mean(const Goodix55X4Pix *frame) {
+  guint64 sum = 0;
+  for (int i = 0; i < GOODIX55X4_FRAME_SIZE; ++i)
+    sum += frame[i];
+  return (gint)(sum / GOODIX55X4_FRAME_SIZE);
+}
+
+/* crop the 4-px borders and squash 12-bit -> 8-bit into an OUT_W x OUT_H buf */
+static void swipe_build_out(const Goodix55X4Pix *frame, guint8 *out) {
+  for (int oy = 0; oy < GOODIX55X4_OUT_HEIGHT; ++oy)
+    for (int ox = 0; ox < GOODIX55X4_OUT_WIDTH; ++ox) {
+      const int sx = ox + GOODIX55X4_CROP;
+      const int sy = oy + GOODIX55X4_CROP;
+      guint v = frame[sx + sy * GOODIX55X4_WIDTH] >> 4;
+      out[ox + oy * GOODIX55X4_OUT_WIDTH] = v > 255 ? 255 : (guint8)v;
+    }
+}
+
+/* 4-channel fixed-pattern-noise correction + p10/p90 contrast stretch.
+ * The sensor reads out 4 interleaved channels cycling across rows; equalise
+ * each channel's mean to the global mean, then stretch the central histogram
+ * so NBIS gets strong ridge/valley contrast. Operates in place on OUT_WxOUT_H. */
+static void swipe_fpn_stretch(guint8 *img) {
+  const int w = GOODIX55X4_OUT_WIDTH, h = GOODIX55X4_OUT_HEIGHT;
+  const gsize n = (gsize)w * h;
+
+  double global_sum = 0;
+  for (gsize i = 0; i < n; ++i)
+    global_sum += img[i];
+  const double global_mean = global_sum / n;
+
+  for (int ch = 0; ch < 4; ++ch) {
+    double ch_sum = 0;
+    gsize ch_n = 0;
+    for (int y = ch; y < h; y += 4)
+      for (int x = 0; x < w; ++x) {
+        ch_sum += img[y * w + x];
+        ch_n++;
+      }
+    if (!ch_n)
+      continue;
+    const double offset = global_mean - (ch_sum / ch_n);
+    for (int y = ch; y < h; y += 4)
+      for (int x = 0; x < w; ++x) {
+        double v = (double)img[y * w + x] + offset;
+        img[y * w + x] = (guint8)CLAMP(v, 0.0, 255.0);
+      }
+  }
+
+  guint32 hist[256] = {0};
+  for (gsize i = 0; i < n; ++i)
+    hist[img[i]]++;
+  gsize lo_t = (n * 10) / 100, hi_t = (n * 90) / 100, cum = 0;
+  guint8 lo = 0, hi = 255;
+  for (int v = 0; v < 256; ++v) {
+    cum += hist[v];
+    if (cum >= lo_t) { lo = (guint8)v; break; }
+  }
+  cum = 0;
+  for (int v = 0; v < 256; ++v) {
+    cum += hist[v];
+    if (cum >= hi_t) { hi = (guint8)v; break; }
+  }
+  if (hi > lo)
+    for (gsize i = 0; i < n; ++i) {
+      int v = (((int)img[i] - lo) * 255) / (hi - lo);
+      img[i] = (guint8)CLAMP(v, 0, 255);
+    }
+}
+
+/* mean absolute difference between two OUT buffers (inter-frame motion) */
+static guint swipe_out_diff(const guint8 *a, const guint8 *b) {
+  guint64 sum = 0;
+  const gsize n = (gsize)GOODIX55X4_OUT_WIDTH * GOODIX55X4_OUT_HEIGHT;
+  for (gsize i = 0; i < n; ++i)
+    sum += a[i] > b[i] ? a[i] - b[i] : b[i] - a[i];
+  return (guint)(sum / n);
+}
+
+static unsigned char swipe_get_pixel(struct fpi_frame_asmbl_ctx *ctx,
+                                     struct fpi_frame *frame, unsigned int x,
+                                     unsigned int y) {
+  return frame->data[x + y * ctx->frame_width];
+}
+
+static struct fpi_frame_asmbl_ctx swipe_asmbl_ctx = {
+    .frame_width = GOODIX55X4_SWIPE_FRAME_W,
+    .frame_height = GOODIX55X4_SWIPE_FRAME_H,
+    .image_width = GOODIX55X4_SWIPE_FRAME_W,
+    .get_pixel = swipe_get_pixel,
+};
+
+/* build a rotated, per-stripe p5/p95-stretched fpi_frame from an OUT buffer */
+static struct fpi_frame *swipe_make_stripe(const guint8 *out) {
+  const gsize frame_bytes =
+      (gsize)GOODIX55X4_SWIPE_FRAME_W * GOODIX55X4_SWIPE_FRAME_H;
+  struct fpi_frame *stripe = g_malloc(sizeof(struct fpi_frame) + frame_bytes);
+  stripe->delta_x = 0;
+  stripe->delta_y = 0;
+
+  const gsize px = (gsize)GOODIX55X4_OUT_WIDTH * GOODIX55X4_OUT_HEIGHT;
+  guint hist[256] = {0};
+  for (gsize p = 0; p < px; ++p)
+    hist[out[p]]++;
+  guint lo = 0, hi = 255, cum = 0;
+  const guint t_lo = (guint)(px * 5 / 100), t_hi = (guint)(px * 95 / 100);
+  for (guint b = 0; b < 256; ++b) {
+    cum += hist[b];
+    if (cum >= t_lo && lo == 0) lo = b;
+    if (cum >= t_hi) { hi = b; break; }
+  }
+  if (hi <= lo)
+    hi = lo + 1;
+
+  for (guint x = 0; x < GOODIX55X4_SWIPE_FRAME_W; ++x)
+    for (guint y = 0; y < GOODIX55X4_SWIPE_FRAME_H; ++y) {
+      guint8 raw = out[x * GOODIX55X4_OUT_WIDTH + y];
+      int v = (int)(raw - lo) * 255 / (int)(hi - lo);
+      stripe->data[x + y * GOODIX55X4_SWIPE_FRAME_W] = (guint8)CLAMP(v, 0, 255);
+    }
+  return stripe;
+}
+
+static void swipe_reset(FpiDeviceGoodixTls55X4 *self) {
+  if (self->strips) {
+    g_slist_free_full(self->strips, g_free);
+    self->strips = NULL;
+  }
+  self->strips_len = 0;
+  self->swipe_frame_idx = 0;
+  self->finger_seen = FALSE;
+  self->finger_moving = FALSE;
+  self->static_count = 0;
+  self->baseline_mean = 0;
+  self->have_kept = FALSE;
+}
+
+static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
+                             gpointer ssm, GError *err);
+
+/* Refresh the orange capture LED, then read the next frame. The fw only keeps
+ * the LED lit while SetLed is sent repeatedly during active capture (a single
+ * SetLed has no visible effect), so we re-send it each frame while waiting for
+ * the finger — that is exactly when the user needs the "swipe now" cue. */
+static void led_then_read_img(FpDevice *dev, gpointer ssm, GError *err) {
+  if (err) {
+    fpi_ssm_mark_failed(ssm, err);
+    return;
+  }
+  goodix_tls_read_image(dev, scan_on_read_img, ssm);
+}
+
 static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
                              gpointer ssm, GError *err) {
-  g_print("SCAN_ON_READ_IMG\n");
   if (err) {
     fpi_ssm_mark_failed(ssm, err);
     return;
   }
 
   FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
-  save_frame(self, data);
-  if (g_slist_length(self->frames) <= GOODIX55X4_CAP_FRAMES) {
-    fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
-  } else {
-    GSList *raw_frames = g_slist_nth(self->frames, 1);
+  FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
 
-    FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
-    struct fpi_frame_asmbl_ctx assembly_ctx;
-    assembly_ctx.frame_width = GOODIX55X4_WIDTH;
-    assembly_ctx.frame_height = GOODIX55X4_HEIGHT;
-    assembly_ctx.image_width = GOODIX55X4_WIDTH * 1;
-    assembly_ctx.get_pixel = get_pix;
+  /* Decode this streamed frame and build the cropped/FPN/stretched OUT buffer. */
+  Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE];
+  decode_frame(frame, data);
+  const gint mean = swipe_raw_mean(frame);
 
-    GSList *frames = NULL;
-    frame_processing_info pinfo = {.dev = self, .frames = &frames};
+  /* Per-pixel background subtraction with the no-finger calibration frame. This
+   * cancels the sensor's fixed pattern (the vertical grid the 4-channel FPN
+   * alone leaves behind) so NBIS detects real ridge minutiae, not grid noise —
+   * exactly what made the single-frame path clean. Mean (above) is taken from
+   * the RAW frame first, since finger detection needs the raw signal level. */
+  if (swipe_raw_mean(self->empty_img) > 500)
+    postprocess_frame(frame, self->empty_img);
 
-    g_slist_foreach(raw_frames, (GFunc)process_frame, &pinfo);
-    frames = g_slist_reverse(frames);
+  guint8 out[GOODIX55X4_OUT_WIDTH * GOODIX55X4_OUT_HEIGHT];
+  swipe_build_out(frame, out);
+  swipe_fpn_stretch(out);
 
-    g_print("MOVEMENT EST\n");
-    fpi_do_movement_estimation(&assembly_ctx, frames);
-    g_print("MOVEMENT EST DOOONEE\n");
-    FpImage *img = fpi_assemble_frames(&assembly_ctx, frames);
-
-    g_slist_free_full(frames, g_free);
-    g_slist_free_full(self->frames, g_free);
-    self->frames = g_slist_alloc();
-
-    g_print("Signal IMG Capture\n");
-    fpi_image_device_image_captured(img_dev, img);
-    // save_image_to_pgm(img, "finger.pgm");
-
-    g_print("Next State\n");
-    fpi_ssm_next_state(ssm);
+  self->swipe_frame_idx++;
+  if (self->baseline_mean == 0) {
+    /* No-finger baseline from the calibration (empty) frame captured before
+     * FDT fired — NOT from this frame, which (post-FDT) already has a finger. */
+    gint bm = swipe_raw_mean(self->empty_img);
+    self->baseline_mean = bm > 500 ? bm : mean;
   }
+
+  /* ---- Mode B: FDT-gated accumulation (opt-in via env GOODIX_SWIPE_FDT) ----
+   * Re-arm FDT_DOWN between a fixed number of frames (user holds & slowly moves
+   * / re-taps), stack edge-to-edge. Kept as a fallback; the DEFAULT is the
+   * streaming swipe path below, which (with background subtraction + distinct-
+   * frame subsampling + edge-to-edge stacking) reliably yields a tall, minutiae-
+   * rich image that NBIS/bozorth matches (genuine ~62, impostor <=14). */
+  if (g_getenv("GOODIX_SWIPE_FDT")) {
+    if (!self->finger_seen) {
+      self->finger_seen = TRUE;
+      fpi_image_device_report_finger_status(img_dev, TRUE);
+    }
+    self->strips = g_slist_prepend(self->strips, swipe_make_stripe(out));
+    self->strips_len++;
+    fp_dbg("SWIPE-FDT frame %u/%d mean=%d\n", self->strips_len,
+            GOODIX55X4_FDT_TARGET, mean);
+    if (self->strips_len < GOODIX55X4_FDT_TARGET) {
+      fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_DOWN); /* next frame */
+      return;
+    }
+    self->strips = g_slist_reverse(self->strips);
+    guint idx = 0;
+    for (GSList *l = self->strips; l; l = l->next, ++idx) {
+      struct fpi_frame *f = l->data;
+      f->delta_x = 0;
+      f->delta_y = (idx == 0) ? 0 : GOODIX55X4_SWIPE_FRAME_H; /* edge-to-edge */
+    }
+    FpImage *bimg = fpi_assemble_frames(&swipe_asmbl_ctx, self->strips);
+    bimg->ppmm = GOODIX55X4_PPMM;
+    bimg->flags |= FPI_IMAGE_COLORS_INVERTED;
+    fp_dbg("SWIPE-FDT assembled %u frames -> %dx%d\n", self->strips_len,
+            fp_image_get_width(bimg), fp_image_get_height(bimg));
+    const char *sd = g_getenv("GOODIX_SAVE_DIR");
+    if (sd) {
+      static guint dseq = 0;
+      char *p = g_strdup_printf("%s/fdt_%05u.pgm", sd, dseq++);
+      save_image_to_pgm(bimg, p);
+      fp_dbg("SAVED %s\n", p);
+      g_free(p);
+    }
+    swipe_reset(self);
+    fpi_image_device_image_captured(img_dev, bimg);
+    fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_DONE);
+    return;
+  }
+
+  /* A finger lowers the capacitive signal well below the no-finger baseline. */
+  const gboolean finger_present =
+      (mean < self->baseline_mean - GOODIX55X4_FINGER_DROP);
+
+  /* ---- Phase 1: stream and wait for the finger to land ---- */
+  if (!self->finger_seen) {
+    if (finger_present) {
+      self->finger_seen = TRUE;
+      fpi_image_device_report_finger_status(img_dev, TRUE);
+      memcpy(self->prev_out, out, sizeof(out));
+      goodix_tls_read_image(dev, scan_on_read_img, ssm); /* skip touch frame */
+      return;
+    }
+    /* Track the no-finger baseline, but adapt ONLY toward HIGHER means. A finger
+     * only ever lowers the capacitive signal, so a symmetric EMA would chase a
+     * slow finger placement downward and the (base - mean) delta would never
+     * reach FINGER_DROP — exactly the bug that made slow swipes stream forever.
+     * Tracking just the upper (no-finger) envelope keeps the threshold stable. */
+    if (mean >= self->baseline_mean)
+      self->baseline_mean = (self->baseline_mean * 7 + mean) / 8;
+    if (self->swipe_frame_idx > 700) { /* ~30s safety cap (bounds thermal load) */
+      swipe_reset(self);
+      fpi_ssm_mark_failed(ssm, fpi_device_error_new(FP_DEVICE_ERROR_GENERAL));
+      return;
+    }
+    /* Keep the LED lit per-frame while waiting (the visible "swipe now" cue). */
+    goodix_send_set_led(dev, 0x00, led_then_read_img, ssm);
+    return;
+  }
+
+  /* ---- Phase 2: finger is down, accumulate moving stripes ---- */
+  gboolean finish = FALSE;
+
+  if (!finger_present) {
+    finish = TRUE; /* finger lifted -> end of swipe */
+  } else {
+    const guint diff = swipe_out_diff(out, self->prev_out);
+    memcpy(self->prev_out, out, sizeof(out));
+
+    if (diff > GOODIX55X4_SWIPE_STATIC_THRESHOLD) {
+      if (!self->finger_moving && self->strips) {
+        /* discard pre-movement strips captured while finger was settling */
+        g_slist_free_full(self->strips, g_free);
+        self->strips = NULL;
+        self->strips_len = 0;
+      }
+      self->finger_moving = TRUE;
+      self->static_count = 0;
+    } else {
+      self->static_count++;
+      if (self->finger_moving &&
+          self->static_count >= GOODIX55X4_SWIPE_STATIC_FRAMES) {
+        /* drop the trailing static strips, the swipe has stopped */
+        for (guint s = 0; s < self->static_count && self->strips; ++s) {
+          g_free(self->strips->data);
+          self->strips = g_slist_delete_link(self->strips, self->strips);
+          self->strips_len--;
+        }
+        finish = TRUE;
+      } else {
+        /* still settling or briefly static: keep streaming, don't store */
+        goodix_tls_read_image(dev, scan_on_read_img, ssm);
+        return;
+      }
+    }
+
+    if (!finish) {
+      if (!self->finger_moving) {
+        goodix_tls_read_image(dev, scan_on_read_img, ssm);
+        return;
+      }
+      /* Subsample: keep this frame only if it is sufficiently DIFFERENT from the
+       * last kept one, so stored stripes cover distinct area instead of blending
+       * into motion-smear (the cause of the low minutiae yield). */
+      const guint kdiff = self->have_kept
+                              ? swipe_out_diff(out, self->last_kept_out)
+                              : G_MAXUINT;
+      if (kdiff >= GOODIX55X4_SWIPE_KEEP_STEP) {
+        self->strips = g_slist_prepend(self->strips, swipe_make_stripe(out));
+        self->strips_len++;
+        memcpy(self->last_kept_out, out, sizeof(out));
+        self->have_kept = TRUE;
+      }
+      if (self->strips_len < GOODIX55X4_SWIPE_MAX_FRAMES) {
+        goodix_tls_read_image(dev, scan_on_read_img, ssm);
+        return;
+      }
+      finish = TRUE; /* hit the cap */
+    }
+  }
+
+  /* ---- swipe ended ---- */
+  if (self->strips_len < GOODIX55X4_SWIPE_MIN_FRAMES) {
+    /* too short to be usable: discard and keep streaming for another swipe */
+    swipe_reset(self);
+    if (++self->scan_retries > GOODIX55X4_MAX_SCAN_RETRIES) {
+      fpi_ssm_mark_failed(ssm, fpi_device_error_new(FP_DEVICE_ERROR_GENERAL));
+      return;
+    }
+    fp_info("swipe too short, waiting for another (retry %u)",
+            self->scan_retries);
+    fpi_image_device_report_finger_status(img_dev, FALSE);
+    goodix_tls_read_image(dev, scan_on_read_img, ssm);
+    return;
+  }
+  self->scan_retries = 0;
+
+  self->strips = g_slist_reverse(self->strips);
+  /* Stack the (subsampled, distinct) stripes EDGE-TO-EDGE. Cross-correlation
+   * registration is unreliable once frames are spaced further than the small
+   * overlap window — it collapses the image. Edge-to-edge stacking of distinct
+   * frames is what the offline validation used and gives a tall, minutiae-rich
+   * image (genuine bozorth ~62, impostor <=14). */
+  guint idx = 0;
+  for (GSList *l = self->strips; l; l = l->next, ++idx) {
+    struct fpi_frame *f = l->data;
+    f->delta_x = 0;
+    f->delta_y = (idx == 0) ? 0 : GOODIX55X4_SWIPE_FRAME_H;
+  }
+  FpImage *img = fpi_assemble_frames(&swipe_asmbl_ctx, self->strips);
+  img->ppmm = GOODIX55X4_PPMM;
+  img->flags |= FPI_IMAGE_COLORS_INVERTED;
+  fp_dbg("swipe assembled %u stripes -> %dx%d", self->strips_len,
+         fp_image_get_width(img), fp_image_get_height(img));
+
+  const char *save_dir = g_getenv("GOODIX_SAVE_DIR");
+  if (save_dir) {
+    static guint dump_seq = 0;
+    char *p = g_strdup_printf("%s/swipe_%05u.pgm", save_dir, dump_seq++);
+    save_image_to_pgm(img, p);
+    fp_dbg("SAVED %s\n", p);
+    g_free(p);
+  }
+
+  swipe_reset(self);
+  fpi_image_device_image_captured(img_dev, img);
+  fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_DONE);
 }
 
 gboolean save_image_to_pgm2(guchar *data, const char *path) {
@@ -750,7 +1182,7 @@ static void scan_query_mcu_cb(FpDevice *dev, guint8 *mcu_state, guint16 len,
   /* Windows parse: byte[2] bit... shows isTlsConnected. Log raw so we can see
    * whether TLS actually took (compare to Windows 01023000003a0000...). */
   gboolean tls_connected = (len > 2) && (mcu_state[2] & 0x10);
-  g_print("MCU STATE: %s  -> isTlsConnected guess=%d\n", hx->str,
+  fp_dbg("MCU STATE: %s  -> isTlsConnected guess=%d\n", hx->str,
           tls_connected);
   g_string_free(hx, TRUE);
   fpi_ssm_next_state(ssm);
@@ -761,14 +1193,14 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
 
   switch (fpi_ssm_get_cur_state(ssm)) {
   case SCAN_STAGE_QUERY_MCU:
-    g_print("QUERY MCU STATE (confirm TLS connected, like Windows)\n");
+    fp_dbg("QUERY MCU STATE (confirm TLS connected, like Windows)\n");
     goodix_send_query_mcu_state(dev, scan_query_mcu_cb, ssm);
     break;
   case SCAN_STAGE_CALIBRATE:
     scan_empty_img(dev, ssm);
     break;
   case SCAN_STAGE_SWITCH_TO_FDT_MODE:
-    g_print("SWITCH TO FDT MODE\n");
+    fp_dbg("SWITCH TO FDT MODE\n");
     /* capture the per-zone baseline from the reply to build fdt_down */
     goodix_send_mcu_switch_to_fdt_mode(
         dev, (guint8 *)fdt_switch_state_mode_55X4,
@@ -776,7 +1208,7 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
     break;
 
   case SCAN_STAGE_SWITCH_TO_FDT_DOWN: {
-    g_print("SWITCH TO FDT DOWN\n");
+    fp_dbg("SWITCH TO FDT DOWN\n");
     FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
     if (self->fdt_down_ready)
       goodix_send_mcu_switch_to_fdt_down(dev, self->fdt_down_dyn,
@@ -788,31 +1220,31 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
           sizeof(fdt_switch_state_down_55X4), NULL, check_none_cmd, ssm);
     break;
   }
+  case SCAN_STAGE_SET_LED:
+    /* Turn on the orange capture LED so the user sees when to swipe. payload
+     * 0x00 is what the Windows driver sends during active capture. */
+    goodix_send_set_led(dev, 0x00, check_none, ssm);
+    break;
   case SCAN_STAGE_GET_IMG:
-    g_print("SWITCH TO GET IMAGE\n");
-    fpi_image_device_report_finger_status(img_dev, TRUE);
-    // Set Sensotr Register first to get valid output
-    // device.write_sensor_register(0x022c, b"\x05\x03")
-    // guint8 payload[] = {0x01, 0x00};
-    // goodix_send_mcu_get_image(dev, check_none_cmd, ssm);
-    // goodix_send_write_sensor_register(dev, 0x022c, payload,
-    // write_sensor_complete, ssm);
+    /* Start streaming frames for the swipe. Finger status is reported from
+     * scan_on_read_img once the finger is actually detected in the image. */
+    fp_dbg("SWITCH TO GET IMAGE (swipe streaming)\n");
     scan_get_img(dev, ssm);
     break;
   case SCAN_STAGE_SWITCH_TO_FDT_MODE2:
-    g_print("SWITCH TO FDT MODE 2\n");
+    fp_dbg("SWITCH TO FDT MODE 2\n");
     goodix_send_mcu_switch_to_fdt_mode(
         dev, (guint8 *)fdt_switch_state_mode2_55X4,
         sizeof(fdt_switch_state_mode2_55X4), NULL, check_none_cmd, ssm);
     break;
   case SCAN_STAGE_SWITCH_TO_FDT_UP_NO_REPLY:
-    g_print("SWITCH TO FDT UP NO REPLY\n");
+    fp_dbg("SWITCH TO FDT UP NO REPLY\n");
     goodix_send_mcu_switch_to_fdt_up_no_reply(
         dev, (guint8 *)fdt_switch_state_up_55X4,
         sizeof(fdt_switch_state_up_55X4), NULL, check_none_cmd, ssm);
     break;
   case SCAN_STAGE_SWITCH_TO_FDT_UP:
-    g_print("SWITCH TO FDT UP\n");
+    fp_dbg("SWITCH TO FDT UP\n");
     goodix_send_mcu_switch_to_fdt_up(dev, (guint8 *)fdt_switch_state_up_55X4,
                                      sizeof(fdt_switch_state_up_55X4), NULL,
                                      check_none_cmd, ssm);
@@ -829,16 +1261,16 @@ static void sleep_run_state(FpiSsm *ssm, FpDevice *dev) {
   switch (fpi_ssm_get_cur_state(ssm)) {
   case SLEEP_STAGE_SWITCH_TO_SLEEP_MODE:
     goodix_reset_state(dev);
-    g_print("SWITCH TO SLEEP MODE\n");
+    fp_dbg("SWITCH TO SLEEP MODE\n");
     goodix_send_mcu_switch_to_sleep_mode(dev, 20, check_idle, ssm);
 
     break;
   case SLEEP_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK:
-    g_print("SWITCH TO SLEEP MODE REALTEK\n");
+    fp_dbg("SWITCH TO SLEEP MODE REALTEK\n");
     goodix_send_mcu_switch_to_sleep_mode_realtek(dev, 0x6c, check_sleep_realtek, ssm);
     break;
   case SLEEP_STAGE_DEACTIVATE:
-    g_print("Deactivated\n");
+    fp_dbg("Deactivated\n");
     goodix_reset_state(dev);
 //    goodix_cancel_receive(dev);
     GError *error = NULL;
@@ -863,7 +1295,7 @@ static void scan_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
     fp_err("failed to scan: %s (code: %d)", error->message, error->code);
     return;
   }
-  g_print("finished scan!");
+  fp_dbg("finished scan!");
   fp_dbg("finished scan");
 }
 
@@ -872,11 +1304,13 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
     fp_err("failed to sleep: %s (code: %d)", error->message, error->code);
     return;
   }
-  g_print("finished sleep!");
+  fp_dbg("finished sleep!");
   fp_dbg("finished sleep");
 }
 
 static void scan_start(FpiDeviceGoodixTls55X4 *dev) {
+  dev->scan_retries = 0;
+  swipe_reset(dev);
   fpi_ssm_start(fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM),
                 scan_complete);
 }
@@ -960,14 +1394,24 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
   dev_class->full_name = "Goodix TLS Fingerprint Sensor 55X4";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
-  dev_class->nr_enroll_stages = 10;
-  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->nr_enroll_stages = 6;
+  dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
 
-  // TODO
-  img_dev_class->bz3_threshold = 24 * 3;
-  img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
-  img_dev_class->img_width = GOODIX55X4_WIDTH;
-  img_dev_class->img_height = GOODIX55X4_HEIGHT;
+  /* This sensor is read-only streamed (same as the Windows driver, which polls
+   * get_image continuously) and does not meaningfully heat from bulk reads. The
+   * default simulated thermal model (180s active -> "hot") spuriously disables a
+   * multi-stage swipe enroll, where we must stream while waiting for each swipe.
+   * Raise the modeled hot time well above a full enroll session. */
+  dev_class->temp_hot_seconds = 30 * 60;
+  dev_class->temp_cold_seconds = 9 * 60;
+
+  /* Swipe assembly produces a tall, minutiae-rich image. Live separation on this
+   * hardware: genuine bozorth 30-62, impostor <=14. 24 sits in the gap with
+   * margin both ways (fewer false rejects on short swipes, clear of impostors). */
+  img_dev_class->bz3_threshold = 24;
+  img_dev_class->algorithm = FPI_DEVICE_ALGO_NBIS;
+  img_dev_class->img_width = GOODIX55X4_SWIPE_FRAME_W; /* 168 */
+  img_dev_class->img_height = 0;                       /* variable */
 
   img_dev_class->img_open = dev_init;
   img_dev_class->img_close = dev_deinit;

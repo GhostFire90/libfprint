@@ -48,6 +48,7 @@
 #define GOODIX_CMD_QUERY_MCU_STATE (0xae)
 #define GOODIX_CMD_ACK (0xb0)
 #define GOODIX_CMD_SET_DRV_STATE (0xc4)
+#define GOODIX_CMD_SET_LED (0xc6)
 #define GOODIX_CMD_REQUEST_TLS_CONNECTION (0xd0)
 #define GOODIX_CMD_MCU_GET_POV_IMAGE (0xd2)
 #define GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED (0xd4)
@@ -99,6 +100,10 @@ typedef struct __attribute__((__packed__)) _GoodixMcuSwitchToIdleMode {
   guint8 sleep_time;
   guint8 : 8;
 } GoodixMcuSwitchToIdleMode;
+
+typedef struct __attribute__((__packed__)) _GoodixSetLed {
+  guint8 state;
+} GoodixSetLed;
 
 typedef struct __attribute__((__packed__)) _GoodixMcuSwitchToSleepModeRealtek {
   guint8 value;
