@@ -67,7 +67,11 @@
 /* rotated stripe: sensor long axis (168) -> width, short axis (48) -> height */
 #define GOODIX55X4_SWIPE_FRAME_W GOODIX55X4_OUT_HEIGHT /* 168 */
 #define GOODIX55X4_SWIPE_FRAME_H GOODIX55X4_OUT_WIDTH  /* 48  */
-#define GOODIX55X4_SWIPE_MIN_FRAMES 5
+/* Minimum distinct stripes for a usable image. A short swipe (e.g. 5 stripes /
+ * ~240px) carries too few minutiae and scores ~0 even for the genuine finger;
+ * such swipes are discarded and the user is asked to swipe again rather than
+ * producing a false no-match. Good deliberate swipes give 15-28 stripes. */
+#define GOODIX55X4_SWIPE_MIN_FRAMES 12
 #define GOODIX55X4_SWIPE_MAX_FRAMES 60   /* hard cap on stored stripes */
 #define GOODIX55X4_FDT_TARGET 8 /* frames per capture in FDT-gated (Mode B) mode */
 #define GOODIX55X4_SWIPE_WAIT_FRAMES 250 /* max frames to wait for finger-on */
