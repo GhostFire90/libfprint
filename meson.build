@@ -1,17 +1,22 @@
 project('libfprint', [ 'c', 'cpp' ],
-    version: '1.94.5',
+    version: '1.94.6',
     license: 'LGPLv2.1+',
     default_options: [
         'buildtype=debugoptimized',
         'warning_level=1',
         'c_std=gnu99',
     ],
-    meson_version: '>= 0.49.0')
+    meson_version: '>= 0.56.0')
 
 gnome = import('gnome')
 
 libfprint_conf = configuration_data()
 libfprint_conf.set_quoted('LIBFPRINT_VERSION', meson.project_version())
+
+prefix = get_option('prefix')
+libdir = prefix / get_option('libdir')
+libexecdir = prefix / get_option('libexecdir')
+datadir = prefix / get_option('datadir')
 
 cc = meson.get_compiler('c')
 cpp = meson.get_compiler('cpp')
@@ -100,41 +105,43 @@ virtual_drivers = [
 ]
 
 default_drivers = [
-    'upektc_img',
-    'vfs5011',
-    'vfs7552',
-    'aes3500',
-    'aes4000',
-    'aes1610',
-    'aes1660',
-    'aes2660',
-    'aes2501',
-    'aes2550',
-    'vfs101',
-    'vfs301',
-    'vfs0050',
-    'etes603',
-    'egis0570',
-    'vcom5s',
-    'synaptics',
-    'elan',
-    'elanmoc',
-    'uru4000',
-    'upektc',
-    'upeksonly',
-    'upekts',
-    'goodixmoc',
-    'nb1010',
-    'fpcmoc',
+    # 'upektc_img',
+    # 'vfs5011',
+    # 'vfs7552',
+    # 'aes3500',
+    # 'aes4000',
+    # 'aes1610',
+    # 'aes1660',
+    # 'aes2660',
+    # 'aes2501',
+    # 'aes2550',
+    # 'vfs101',
+    # 'vfs301',
+    # 'vfs0050',
+    # 'etes603',
+    # 'egis0570',
+    # 'vcom5s',
+    # 'synaptics',
+    # 'elan',
+    # 'elanmoc',
+    # 'uru4000',
+    # 'upektc',
+    # 'upeksonly',
+    # 'upekts',
+    # 'goodixmoc',
+    # 'nb1010',
+    # 'fpcmoc',
+    'goodixtls511',
+    'goodixtls55x4',
 
     # SPI
-    'elanspi',
+    # 'elanspi',
 ]
 
 # FIXME: All the drivers should be fixed by adjusting the byte order.
 # See https://gitlab.freedesktop.org/libfprint/libfprint/-/issues/236
 endian_independent_drivers = virtual_drivers + [
-    'aes3500',
+    # 'aes3500',
     'synaptics',
 ]
 
@@ -158,6 +165,8 @@ driver_helper_mapping = {
     'aes4000' : [ 'aeslib', 'aes3k' ],
     'uru4000' : [ 'nss' ],
     'elanspi' : [ 'udev' ],
+    'goodixtls511' : [ 'goodixtls' ],
+    'goodixtls55x4' : [ 'goodixtls' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
     'virtual_device_storage' : [ 'virtual' ],
@@ -213,6 +222,24 @@ foreach i : driver_helpers
 
         libfprint_conf.set10('HAVE_PIXMAN', true)
         optional_deps += imaging_dep
+    elif i == 'nss'
+        nss_dep = dependency('nss', required: false)
+        if not nss_dep.found()
+            error('nss is required for @0@ and possibly others'.format(driver))
+        endif
+        optional_deps += nss_dep
+    elif i == 'goodixtls'
+        openssl_dep = dependency('openssl', required: false)
+        if not openssl_dep.found()
+            error('openssl is required for @0@ and possibly others'.format(driver))
+        endif
+        optional_deps += openssl_dep
+
+        threads_dep = dependency('threads', required: false)
+        if not threads_dep.found()
+            error('threads is required for @0@ and possibly others'.format(driver))
+        endif
+        optional_deps += threads_dep
     elif i == 'nss'
         nss_dep = dependency('nss', required: false)
         if not nss_dep.found()
@@ -286,8 +313,6 @@ else
 endif
 
 if get_option('gtk-examples')
-    gnome = import('gnome')
-
     gtk_dep = dependency('gtk+-3.0', required: false)
     if not gtk_dep.found()
         error('GTK+ 3.x is required for GTK+ examples')
@@ -299,9 +324,7 @@ subdir('libfprint')
 
 configure_file(output: 'config.h', configuration: libfprint_conf)
 
-subdir('examples')
 if get_option('doc')
-    gnome = import('gnome')
     subdir('doc')
 endif
 if get_option('gtk-examples')
@@ -310,6 +333,8 @@ endif
 
 subdir('data')
 subdir('tests')
+
+subdir('examples')
 
 pkgconfig = import('pkgconfig')
 pkgconfig.generate(

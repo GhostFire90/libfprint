@@ -141,6 +141,10 @@ driver_sources = {
         [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
+    'goodixtls511' :
+        [ 'drivers/goodixtls/goodix511.c' ],
+    'goodixtls55x4' :
+        [ 'drivers/goodixtls/goodix55x4.c' ],
 }
 
 helper_sources = {
@@ -150,6 +154,8 @@ helper_sources = {
         [ 'drivers/aesx660.c' ],
     'aes3k' :
         [ 'drivers/aes3k.c' ],
+    'goodixtls' :
+        [ 'drivers/goodixtls/goodix_proto.c', 'drivers/goodixtls/goodix.c', 'drivers/goodixtls/goodixtls.c' ],
     'nss' :
         [ ],
     'udev' :
@@ -161,10 +167,112 @@ helper_sources = {
 drivers_sources = []
 drivers_cflags = []
 foreach driver: drivers
-    drivers_sources += driver_sources[driver]
-endforeach
-foreach helper : driver_helpers
-    drivers_sources += helper_sources[helper]
+    if driver == 'upekts'
+        drivers_sources += [ 'drivers/upekts.c', 'drivers/upek_proto.c' ]
+    endif
+    if driver == 'upektc'
+        drivers_sources += [ 'drivers/upektc.c' ]
+    endif
+    if driver == 'upeksonly'
+        drivers_sources += [ 'drivers/upeksonly.c' ]
+    endif
+    if driver == 'uru4000'
+        drivers_sources += [ 'drivers/uru4000.c' ]
+    endif
+    if driver == 'aes1610'
+        drivers_sources += [ 'drivers/aes1610.c' ]
+        aeslib = true
+    endif
+    if driver == 'aes1660'
+        drivers_sources += [ 'drivers/aes1660.c' ]
+        aeslib = true
+        aesx660 = true
+    endif
+    if driver == 'aes2501'
+        drivers_sources += [ 'drivers/aes2501.c' ]
+        aeslib = true
+    endif
+    if driver == 'aes2550'
+        drivers_sources += [ 'drivers/aes2550.c' ]
+        aeslib = true
+    endif
+    if driver == 'aes2660'
+        drivers_sources += [ 'drivers/aes2660.c' ]
+        aeslib = true
+        aesx660 = true
+    endif
+    if driver == 'aes3500'
+        drivers_sources += [ 'drivers/aes3500.c' ]
+        aeslib = true
+        aes3k = true
+    endif
+    if driver == 'aes4000'
+        drivers_sources += [ 'drivers/aes4000.c' ]
+        aeslib = true
+        aes3k = true
+    endif
+    if driver == 'vcom5s'
+        drivers_sources += [ 'drivers/vcom5s.c' ]
+    endif
+    if driver == 'vfs101'
+        drivers_sources += [ 'drivers/vfs101.c' ]
+    endif
+    if driver == 'vfs301'
+        drivers_sources += [ 'drivers/vfs301.c', 'drivers/vfs301_proto.c' ]
+    endif
+    if driver == 'vfs5011'
+        drivers_sources += [ 'drivers/vfs5011.c' ]
+    endif
+    if driver == 'vfs7552'
+        drivers_sources += [ 'drivers/vfs7552.c' ]
+    endif
+    if driver == 'upektc_img'
+        drivers_sources += [ 'drivers/upektc_img.c',  'drivers/upek_proto.c' ]
+    endif
+    if driver == 'etes603'
+        drivers_sources += [ 'drivers/etes603.c' ]
+    endif
+    if driver == 'vfs0050'
+        drivers_sources += [ 'drivers/vfs0050.c' ]
+    endif
+    if driver == 'elan'
+        drivers_sources += [ 'drivers/elan.c' ]
+    endif
+    if driver == 'virtual_image'
+        drivers_sources += [ 'drivers/virtual-image.c' ]
+    endif
+    if driver == 'virtual_device'
+        drivers_sources += [ 'drivers/virtual-device.c' ]
+    endif
+    if driver == 'virtual_device_storage'
+        drivers_sources += [ 'drivers/virtual-device-storage.c' ]
+    endif
+    if driver.startswith('virtual_')
+        drivers_sources += [ 'drivers/virtual-device-listener.c' ]
+    endif
+    if driver == 'synaptics'
+    drivers_sources += [
+        'drivers/synaptics/synaptics.c',
+        'drivers/synaptics/bmkt_message.c',
+    ]
+    endif
+    if driver == 'goodixmoc'
+    drivers_sources += [
+        'drivers/goodixmoc/goodix.c',
+        'drivers/goodixmoc/goodix_proto.c',
+    ]
+    endif
+    if driver == 'nb1010'
+    drivers_sources += [
+        'drivers/nb1010.c',
+    ]
+    endif
+    if driver == 'goodixtls511'
+    drivers_sources += ['drivers/goodixtls/goodix_proto.c', 'drivers/goodixtls/goodix.c', 'drivers/goodixtls/goodix511.c', 'drivers/goodixtls/goodixtls.c']
+    endif
+    if driver == 'goodixtls55x4'
+    drivers_sources += ['drivers/goodixtls/goodix_proto.c', 'drivers/goodixtls/goodix.c', 'drivers/goodixtls/goodix55x4.c', 'drivers/goodixtls/goodixtls.c']
+    endif
 endforeach
 
 
@@ -222,7 +330,11 @@ deps = [
     gobject_dep,
     gusb_dep,
     mathlib_dep,
+    openssl_dep,
+    threads_dep,
 ] + optional_deps
+
+subdir('sigfm')
 
 # These are empty and only exist so that the include directories are created
 # in the build tree. This silences a build time warning.
@@ -246,13 +358,15 @@ libnbis = static_library('nbis',
     ]),
     install: false)
 
+priv_deps = deps + libsigfm
+
 libfprint_private = static_library('fprint-private',
     sources: [
         fpi_enums,
         libfprint_private_sources,
     ],
     dependencies: deps,
-    link_with: libnbis,
+    link_with: [libnbis, libsigfm],
     install: false)
 
 libfprint_drivers = static_library('fprint-drivers',
@@ -263,7 +377,7 @@ libfprint_drivers = static_library('fprint-drivers',
     install: false)
 
 mapfile = files('libfprint.ver')
-vflag = '-Wl,--version-script,@0@/@1@'.format(meson.source_root(), mapfile[0])
+vflag = '-Wl,--version-script,@0@/@1@'.format(meson.project_source_root(), mapfile[0])
 
 libfprint = shared_library(versioned_libname.split('lib')[1],
     sources: [
@@ -339,7 +453,7 @@ sync_udev_udb = custom_target('sync-udev-hwdb',
     command: [
         'cp', '-v',
         udev_hwdb_generator.full_path(),
-        meson.source_root() / 'data'
+        meson.project_source_root() / 'data'
     ]
 )
 
