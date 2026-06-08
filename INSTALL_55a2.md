@@ -165,10 +165,13 @@ The fix is to re-write the factory all-zero/whitebox PSK (provisioning only, no
 firmware erase) using the **goodix-fp-dump** tooling:
 
 ```bash
+git clone https://github.com/Ravira43/goodix-fp-dump.git
+cd goodix-fp-dump
+python3 -m venv .venv
+.venv/bin/pip install pyusb
 sudo systemctl stop fprintd
-# from your goodix-fp-dump checkout, with the 55x4 driver constants:
-sudo .venv/bin/python -c "import usb.core,time; d=usb.core.find(idVendor=0x27c6,idProduct=0x55a2); d.reset(); time.sleep(2)"
 sudo .venv/bin/python restore_psk_55a2.py   # writes PSK_WHITE_BOX, verifies hash
+sudo systemctl start fprintd
 ```
 After it reports the hash is back to `81b8ff49...`, fingerprint works again.
 You must re-run this after every Windows boot.
