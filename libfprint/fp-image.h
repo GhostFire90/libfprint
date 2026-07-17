@@ -23,7 +23,7 @@
 // #include "sigfm/sigfm.hpp"
 #include <gio/gio.h>
 
-struct SigfmImgInfo;
+typedef struct _SigfmImgInfo SigfmImgInfo;
 
 G_BEGIN_DECLS
 
