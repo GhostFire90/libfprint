@@ -23,7 +23,7 @@
 // #include "sigfm/sigfm.hpp"
 #include <gio/gio.h>
 
-typedef struct _SigfmImgInfo SigfmImgInfo;
+struct SigfmImgInfo;
 
 G_BEGIN_DECLS
 
@@ -64,6 +64,6 @@ void           fp_minutia_get_coords (FpMinutia *min,
                                       gint      *x,
                                       gint      *y);
 
-SigfmImgInfo * fp_image_get_sigfm_info (FpImage * self);
+struct SigfmImgInfo * fp_image_get_sigfm_info (FpImage * self);
 
 G_END_DECLS
