@@ -20,8 +20,10 @@
 
 #pragma once
 
-#include "sigfm/sigfm.hpp"
+// #include "sigfm/sigfm.hpp"
 #include <gio/gio.h>
+
+struct SigfmImgInfo;
 
 G_BEGIN_DECLS
 
